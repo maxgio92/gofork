@@ -8,88 +8,44 @@ import (
 	"syscall"
 
 	"github.com/maxgio92/gofork/container/pkg/uts"
+	"github.com/pkg/errors"
 )
 
 const (
 	self = "/proc/self/exe"
 )
 
-var initializers = make(map[string]func())
-
-// The package init function runs twice: once in the host manager and
-// once when the manager is "fork"ed inside the unshared namespaces to
-// initialize the container and run its command.
-// See https://github.com/moby/moby/pkg/reexec for reference.
-func runInit() {
-	registerInitializer("contInitAndRun")
-	if initializer, ok := initializers[os.Args[0]]; ok {
-		initializer()
-		os.Exit(0)
-	}
+type Options struct {
+	exe  string
+	args []string
 }
 
-func registerInitializer(name string) {
-	if _, exists := initializers[name]; exists {
-		panic(fmt.Sprintf("initializer already registered under name %q", name))
-	}
-
-	initializers[name] = contInitAndRun
+type Container struct {
+	cmd *exec.Cmd
 }
 
-// contInitAndRun is an initializer that is executed once the manager is "fork"ed.
+func NewContainer() *Container {
+	cmd := new(exec.Cmd)
+	return &Container{cmd: cmd}
+}
+
+// run is an initializer that is executed once the manager is "fork"ed.
 // The manager process is reexecuted inside the unshared namespaces in order to
 // setup during the initialization this function ensures the required namespaces
 // for the container before running its command.
-func contInitAndRun() {
-	var exe string
-	var arg []string
-	if len(os.Args) > 0 {
-		exe = os.Args[1]
-	}
-	if len(os.Args) > 1 {
-		arg = os.Args[2:]
-	}
-	cmd := exec.Command(exe, arg...)
+func (o *Container) Run(exe string, args ...string) error {
+	o.cmd = exec.Command(exe, args...)
 
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	o.cmd.Stdout = os.Stdout
+	o.cmd.Stderr = os.Stderr
+	o.cmd.Stdin = os.Stdin
 
-	hostName := uts.GetRandHostName()
-	if err := syscall.Sethostname([]byte(hostName)); err != nil {
-		fmt.Fprintf(os.Stderr, "error setting hostname - %s\n", err)
-		os.Exit(1)
-	}
-
-	ps1 := fmt.Sprintf("[%s]$ ", hostName)
-	cmd.Env = append(cmd.Env, fmt.Sprintf("PS1=%s", ps1))
-
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "error running container with command %s: %s", cmd.String(), err)
-		os.Exit(1)
-	}
+	return o.cmd.Run()
 }
 
-func main() {
-	var interactive, terminal bool
-	flag.BoolVar(&interactive, "i", false, "Attach to STDIN")
-	flag.BoolVar(&terminal, "t", false, "Attach to STDOUT and STDOUT")
-	flag.Parse()
-	if len(flag.Args()) == 0 {
-		flag.Usage()
-		os.Exit(1)
-	}
-	runInit()
-
-	args := make([]string, 0)
-	args = append(args, "contInitAndRun")
-	args = append(args, flag.Args()...)
-
-	// The manager needs to be "fork"ed in order to initialize stuff
-	// after the namespaces have been unshared but before executing
-	// the container command.
-	cmd := &exec.Cmd{
-		Path: self,
+func (o *Container) Init(exe string, args ...string) error {
+	o.cmd = &exec.Cmd{
+		Path: exe,
 		Args: args,
 		SysProcAttr: &syscall.SysProcAttr{
 			Pdeathsig: syscall.SIGTERM,
@@ -98,7 +54,7 @@ func main() {
 
 	// Unshare the namespaces and run the container command from the
 	// unshared namespaces.
-	cmd.SysProcAttr = &syscall.SysProcAttr{
+	o.cmd.SysProcAttr = &syscall.SysProcAttr{
 		Unshareflags: syscall.CLONE_NEWUSER |
 			syscall.CLONE_NEWUSER |
 			syscall.CLONE_NEWIPC |
@@ -119,20 +75,79 @@ func main() {
 		AmbientCaps: []uintptr{}, // TODO: enable selective caps.
 	}
 
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdin
-	cmd.Stderr = os.Stderr
+	o.cmd.Stdin = os.Stdin
+	o.cmd.Stdout = os.Stdin
+	o.cmd.Stderr = os.Stderr
 
-	// Start the child process.
-	var err error
-	if err = cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "cannot start command %s\n", cmd.String())
+	return o.cmd.Start()
+}
+
+func (o *Container) SetHostname() error {
+	hostName := uts.GetRandHostName()
+	if err := syscall.Sethostname([]byte(hostName)); err != nil {
+		return errors.Wrap(err, "error setting hostname")
+	}
+
+	return nil
+}
+
+func (o *Container) Wait() error {
+	return o.cmd.Wait()
+}
+
+func main() {
+	o := new(Options)
+	flag.Parse()
+	if len(flag.Args()) == 0 {
+		flag.Usage()
 		os.Exit(1)
 	}
 
-	// Wait for the child process.
-	if err = cmd.Wait(); err != nil {
-		fmt.Fprintf(os.Stderr, "container %d terminated with error: %v\n", cmd.Process.Pid, err)
+	c := NewContainer()
+
+	// This manager runs twice: once in the host manager and
+	// once when the manager is re-executed in the initialized container,
+	// before preparing the last stuff and running the continer command.
+	// See https://github.com/moby/moby/pkg/reexec for reference.
+	if os.Args[0] == "run" {
+		if len(flag.Args()) > 0 {
+			o.exe = flag.Args()[0]
+		}
+		if len(flag.Args()) > 1 {
+			args := flag.Args()[1:]
+			o.args = args
+		}
+
+		if err := c.SetHostname(); err != nil {
+			fmt.Fprintf(os.Stderr, "%v", err)
+			os.Exit(1)
+		}
+		if err := c.Run(o.exe, o.args...); err != nil {
+			fmt.Fprintf(os.Stderr, "error running container: %s", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	// The container needs to be initialized first, by self re-executing,
+	// before running the container command, just before which set stuff
+	// like the hostname.
+	args := make([]string, 0)
+	args = append(args, "run")
+
+	// Skip the executable path.
+	os.Args = os.Args[1:]
+	args = append(args, os.Args...)
+
+	// Re-execute in the container.
+	if err := c.Init(self, args...); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot initialize container: %s\n", err)
+		os.Exit(1)
+	}
+
+	// Wait for the container process.
+	if err := c.Wait(); err != nil {
+		fmt.Fprintf(os.Stderr, "container terminated with error: %s\n", err)
 		os.Exit(1)
 	}
 }
